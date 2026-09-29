@@ -137,7 +137,17 @@ async function publishStream(streamId, { transport, kind, rtpParameters, metadat
   // stopped until someone re-ticks the checkbox. A restart of just the
   // video ENCODER (the \u23f1 clock-overlay button) never hits this path at
   // all -- it reuses the same local RTP port/Producer, see publish.js.
-  if (kind === 'video' && hlsWanted.has(streamId)) {
+  //
+  // Also retrigger on the AUDIO producer (re)appearing, not just video:
+  // publish.js creates the video and audio Producers as two separate calls,
+  // with no guaranteed ordering/timing between them. If HLS was enabled
+  // from the start (HLS_ENABLED=1) and the video Producer happens to land
+  // first, the auto-restart above used to fire with `stream.audioProducer`
+  // still unset, permanently starting that HLS session video-only -- there
+  // was no later trigger to pick up audio once it showed up. `_restartHlsFor`
+  // is idempotent (startHls always stops any previous session first), so
+  // it's safe to call again here once both producers are known.
+  if (hlsWanted.has(streamId) && existing.producer && (kind === 'video' || kind === 'audio')) {
     _restartHlsFor(streamId).catch((err) =>
       console.error(`[HLS] ${streamId}: auto-restart failed: ${err.message}`));
   }
