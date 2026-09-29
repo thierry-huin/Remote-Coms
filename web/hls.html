@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Winus Video — HLS</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  html, body { width: 100%; height: 100%; background: #000; overflow: hidden; }
+  #video { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; }
+  /* Stream name (top-left) + a self-updating clock (top-right) -- the "g2g"
+     (glass-to-glass) visual reference: compare this on-screen clock against
+     a real clock next to the TV, same spirit as the publisher's own ⏱
+     clockoverlay button (installer/tools/publish.js), just rendered as plain
+     HTML/CSS here instead of burned into the video pixels (see the plan's
+     "opción mejor" -- avoids any server-side decode/encode of video). */
+  #overlay-name, #overlay-clock {
+    position: absolute; top: 0; padding: 10px 18px;
+    font-family: system-ui, sans-serif; font-size: 22px; font-weight: bold;
+    color: #e0e0e0; text-shadow: 0 1px 4px rgba(0,0,0,0.9);
+    background: linear-gradient(rgba(0,0,0,0.55), transparent);
+    pointer-events: none; z-index: 2;
+  }
+  #overlay-name { left: 0; }
+  #overlay-clock { right: 0; font-variant-numeric: tabular-nums; }
+  #message {
+    position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+    font-family: system-ui, sans-serif; font-size: 26px; color: #a0a0b8; text-align: center;
+    padding: 40px; z-index: 3;
+  }
+</style>
+</head>
+<body>
+  <video id="video" autoplay muted playsinline></video>
+  <div id="overlay-name"></div>
+  <div id="overlay-clock"></div>
+  <div id="message">Cargando...</div>
+  <script src="hls.min.js"></script>
+  <script>
+    const params = new URLSearchParams(location.search);
+    const streamId = params.get('s');
+    const key = params.get('k');
+    const video = document.getElementById('video');
+    const overlayName = document.getElementById('overlay-name');
+    const overlayClock = document.getElementById('overlay-clock');
+    const messageEl = document.getElementById('message');
+
+    const RETRY_MS = 5000;
+    let hls = null;
+    let currentPlaylistUrl = null;
+
+    function showMessage(text) {
+      messageEl.textContent = text;
+      messageEl.style.display = 'flex';
+    }
+    function hideMessage() {
+      messageEl.style.display = 'none';
+    }
+
+    function tickClock() {
+      overlayClock.textContent = new Date().toLocaleTimeString();
+    }
+    setInterval(tickClock, 1000);
+    tickClock();
+
+    function attachHls(url) {
+      if (currentPlaylistUrl === url) return; // already playing this playlist
+      currentPlaylistUrl = url;
+      if (window.Hls && window.Hls.isSupported()) {
+        if (hls) { try { hls.destroy(); } catch (_) {} }
+        hls = new window.Hls({ liveDurationInfinity: true });
+        hls.loadSource(url);
+        hls.attachMedia(video);
+        hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+          if (data && data.fatal) {
+            // Let the next poll() cycle recover -- a fresh /api/hls-info
+            // fetch will re-attach if the stream is still (or becomes) live.
+            currentPlaylistUrl = null;
+          }
+        });
+      } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
+        // Native HLS support (Safari, some Smart TV browsers)
+        video.src = url;
+      } else {
+        showMessage('Este navegador no soporta HLS.');
+        return;
+      }
+      video.play().catch(() => {});
+      hideMessage();
+    }
+
+    async function poll() {
+      if (!streamId || !key) {
+        showMessage('Enlace inválido.');
+        return;
+      }
+      try {
+        const res = await fetch(`/api/hls-info?s=${encodeURIComponent(streamId)}&k=${encodeURIComponent(key)}`, { cache: 'no-store' });
+        if (!res.ok) {
+          currentPlaylistUrl = null;
+          showMessage('Stream no disponible.');
+          return;
+        }
+        const data = await res.json();
+        overlayName.textContent = data.streamName || '';
+        attachHls(data.playlistUrl);
+      } catch (_) {
+        showMessage('Stream no disponible.');
+      }
+    }
+
+    poll();
+    setInterval(poll, RETRY_MS);
+  </script>
+</body>
+</html>

@@ -1,0 +1,84 @@
+services:
+  backend:
+    container_name: video-backend
+    build: ./backend
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - HLS_DIR=/app/data/hls
+    volumes:
+      - ./.env:/app/.env:ro
+      - video-data:/app/data
+      - hls-data:/app/data/hls
+    ports:
+      - "${RTP_MIN_PORT:-10201}-${RTP_MAX_PORT:-10400}:${RTP_MIN_PORT:-10201}-${RTP_MAX_PORT:-10400}/udp"
+      - "10502-10600:10502-10600/udp"
+    networks:
+      - video-net
+
+  nginx:
+    container_name: video-nginx
+    image: nginx:alpine
+    restart: unless-stopped
+    ports:
+      - "${HTTPS_PORT:-9443}:9443"
+      - "${HTTP_PORT:-9080}:9080"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      - ./web:/usr/share/nginx/html:ro
+      - ./certs:/etc/nginx/certs:ro
+      - hls-data:/usr/share/nginx/hls:ro
+    depends_on:
+      - backend
+    networks:
+      - video-net
+
+  # Standalone TURN server -- winus-video no longer depends on Winus
+  # Intercom's coturn being installed/reachable. network_mode: host (not
+  # the video-net bridge) because coturn needs to see/report the real host
+  # IP and relay a wide ephemeral UDP range; Docker's bridge NAT makes that
+  # painful to map port-by-port.
+  coturn:
+    image: coturn/coturn:latest
+    container_name: video-coturn
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - |
+        if [ -z "${EXTERNAL_IP}" ]; then
+          echo "" >&2
+          echo "FATAL: EXTERNAL_IP is not set in .env." >&2
+          echo "Set EXTERNAL_IP (and LOCAL_IP) to this server's public and" >&2
+          echo "private addresses, e.g.:" >&2
+          echo "  EXTERNAL_IP=203.0.113.10" >&2
+          echo "  LOCAL_IP=10.0.0.5" >&2
+          echo "Refusing to start with a hard-coded default to avoid" >&2
+          echo "accidentally routing TURN traffic to another server." >&2
+          exit 1
+        fi
+        if [ -z "${LOCAL_IP}" ]; then
+          echo "FATAL: LOCAL_IP is not set in .env." >&2
+          exit 1
+        fi
+        RESOLVED_IP=$$(getent hosts ${EXTERNAL_IP} | awk '{print $$1}' | head -1)
+        if [ -z "$$RESOLVED_IP" ]; then
+          echo "FATAL: Could not resolve EXTERNAL_IP=${EXTERNAL_IP}" >&2
+          exit 1
+        fi
+        echo "TURN external-ip: $$RESOLVED_IP / ${LOCAL_IP}"
+        echo "TURN listening on port ${TURN_PORT:-3480}"
+        exec turnserver -c /etc/coturn/turnserver.conf \
+          --listening-port=${TURN_PORT:-3480} \
+          --user=${TURN_USER:-intercom}:${TURN_PASSWORD:-intercom2024} \
+          --external-ip=$$RESOLVED_IP/${LOCAL_IP}
+
+volumes:
+  video-data:
+  hls-data:
+
+networks:
+  video-net:
+    driver: bridge

@@ -1,0 +1,420 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Winus Video</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { background: #1a1a2e; color: #e0e0e0; font-family: system-ui, sans-serif; }
+    .header { background: #16213e; padding: 12px 20px; display: flex; align-items: center; gap: 12px; }
+    .header h1 { font-size: 20px; }
+    .header .badge { background: #7b2ff7; padding: 2px 10px; border-radius: 12px; font-size: 12px; }
+    /* Dynamic width -- scales with the actual monitor/window size instead of
+       capping at a fixed px value, so the video (flex:1 inside it, see
+       #video-column) always uses whatever screen space is available. The
+       max-width is just a sane ceiling for ultra-wide monitors. */
+    .container { width: 96vw; max-width: 2400px; margin: 20px auto; padding: 0 20px; }
+    #status { padding: 8px 16px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+    .status-connecting { background: #ff980033; border: 1px solid #ff9800; }
+    .status-ok { background: #00e67633; border: 1px solid #00e676; }
+    .status-error { background: #ff525233; border: 1px solid #ff5252; }
+    /* Stream list (selector) */
+    .stream-list { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 16px; }
+    .stream-btn { background: #16213e; border: 2px solid #333; color: #e0e0e0; padding: 10px 20px; border-radius: 8px; cursor: pointer; font-size: 14px; transition: all 0.2s; }
+    .stream-btn:hover { border-color: #7b2ff7; }
+    /* Blue for the currently selected stream, matching the pressed-button
+       convention used elsewhere (e.g. .btn-peer-talk.active, #2979ff). */
+    .stream-btn.active { border-color: #2979ff; background: #2979ff22; }
+    .stream-btn.active::before { content: '● '; color: #2979ff; }
+    /* Fullscreen video */
+    /* Wraps #video-column + #sidebar-controls side by side. Deliberately
+       a SIBLING wrapper, not something inside #video-container: the browser
+       Fullscreen API (see toggleFullscreen()) only fullscreens
+       #video-container itself, so anything placed here in the sidebar (or
+       in #video-controls-bar, see below) automatically disappears in
+       fullscreen without any extra JS -- by design, only the tally border +
+       own VU meter remain visible in fullscreen. */
+    #video-sidebar-layout { display: none; gap: 16px; align-items: flex-start; }
+    /* Stacks #video-container above #video-controls-bar (Name/Mic/Talkback,
+       stream name/g2g/Fullscreen -- all moved OUT of the video itself, see
+       #video-controls-bar below), as the flex:1 column next to the sidebar. */
+    #video-column { display: flex; flex-direction: column; gap: 10px; flex: 1; min-width: 0; }
+    #video-container { position: relative; background: #000; border-radius: 12px; overflow: hidden; }
+    #video-container video { width: 100%; display: block; }
+    /* Tally border: red while PGM is actually on-air, green while Talkback is.
+       A ::after overlay (not box-shadow) is required here: the <video> fills
+       #video-container edge-to-edge, so an inset box-shadow on the container
+       itself gets painted UNDER the video and is invisible -- this overlay
+       paints on top instead. */
+    #video-container::after {
+      content: ''; position: absolute; inset: 0; z-index: 3; pointer-events: none;
+      border: 5px solid transparent; box-sizing: border-box; transition: border-color 0.15s;
+    }
+    #video-container.tally-pgm::after { border-color: #ff5252; }
+    #video-container.tally-talkback::after { border-color: #00e676; }
+    #video-top-overlay { position: absolute; top: 0; right: 0; padding: 10px 16px; background: linear-gradient(rgba(0,0,0,0.8), transparent); }
+    /* "ON AIR" box (see setOnAir/onAirChanged): toggled by the publisher's
+       On Air button (next to Play/Stop), shown top-CENTERED on top of the
+       video for admin AND guest-link viewers alike -- purely a signal that
+       commentators may start speaking, independent of PGM/Talkback state.
+       Deliberately its OWN centered overlay so it never sits on top of the
+       publisher's burned-in clock overlay (GStreamer clockoverlay, also
+       top-left -- see tools/gstreamer-publish.sh). */
+    #video-top-center-overlay { position: absolute; top: 0; left: 50%; transform: translateX(-50%); padding: 10px 16px; z-index: 2; }
+    #onair-badge {
+      display: none; align-items: center; gap: 7px;
+      background: rgba(0,0,0,0.6); border: 1px solid #ff5252;
+      padding: 5px 12px; border-radius: 6px;
+    }
+    #onair-led {
+      width: 11px; height: 11px; border-radius: 50%; flex-shrink: 0;
+      background: #ff5252; box-shadow: 0 0 8px #ff5252;
+      animation: onair-pulse 1.4s ease-in-out infinite;
+    }
+    @keyframes onair-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.35; }
+    }
+    #onair-badge span.onair-text {
+      font-weight: bold; font-size: 13px; letter-spacing: 1px; color: #ff5252;
+    }
+    /* VU meters: segmented LED style -- a stack of blocks that light up from
+       the bottom as the level rises, like a hardware VU/peak meter, instead
+       of a smoothly-filling bar. #vu-meter (return-audio, this commentator's
+       OWN mic/talkback level) stays overlaid on the video itself -- it's the
+       one meter the spec keeps on-screen alongside the tally border. Every
+       OTHER meter (incoming/Retorno, per-peer) now lives in #sidebar-controls
+       instead, see .sidebar-vu-meter below. */
+    #vu-meter {
+      position: absolute; top: 50%; right: 12px; transform: translateY(-50%);
+      width: 18px; height: 240px; background: rgba(0,0,0,0.45); border-radius: 6px;
+      display: none; flex-direction: column-reverse; gap: 2px; padding: 3px; box-sizing: border-box; z-index: 2;
+    }
+    .vu-segment { flex: 1; border-radius: 2px; background: rgba(255,255,255,0.08); }
+    .vu-segment.lit-green { background: #00e676; }
+    .vu-segment.lit-orange { background: #ffab40; }
+    .vu-segment.lit-red { background: #ff5252; }
+    /* ── Sidebar (al costado del video): Retorno + un cuadro por cada otro
+       comentarista activo. See renderPeerSidebar()/setupIncomingVuMeter in
+       viewer.js. Sits OUTSIDE #video-container on purpose -- see the
+       #video-sidebar-layout comment above for why that means it's hidden
+       automatically while in fullscreen. */
+    #sidebar-controls {
+      display: none; flex-direction: column; gap: 12px; flex-shrink: 0;
+    }
+    /* Peer boxes (Com 1/Com 2/...) sit side by side below Retorno, wrapping
+       to a new row if there are more than fit -- see the reference layout.
+       #sidebar-controls has no fixed width (align-items defaults to
+       stretch), so it auto-sizes to whichever row is widest and #retorno-box
+       stretches to match that same width. */
+    #peer-sidebar-boxes { display: flex; flex-direction: row; flex-wrap: wrap; gap: 12px; }
+    #peer-sidebar-boxes .sidebar-box { width: 110px; flex: 0 0 auto; }
+    .sidebar-box {
+      display: flex; flex-direction: column; align-items: center; gap: 8px;
+      background: #16213e; border: 1px solid #333; border-radius: 10px; padding: 12px 8px;
+    }
+    .sidebar-box .sidebar-box-name {
+      font-size: 12px; font-weight: bold; color: #e0e0e0; text-align: center;
+      max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+    }
+    .sidebar-box-fader-row { display: flex; align-items: center; gap: 10px; }
+    /* Vertical fader: a plain horizontal <input type=range> rotated -90deg,
+       reusing the same thumb/track look as the rest of the app's sliders
+       (see .volume-controls input[type=range]) rather than the nonstandard/
+       inconsistent-across-browsers `-webkit-appearance: slider-vertical`. */
+    .fader-vertical-wrap { width: 32px; height: 120px; display: flex; align-items: center; justify-content: center; }
+    .fader-vertical-wrap input[type=range] {
+      width: 112px; height: 4px; -webkit-appearance: none; appearance: none;
+      background: #555; border-radius: 2px; outline: none; cursor: pointer; transform: rotate(-90deg);
+    }
+    .fader-vertical-wrap input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 16px; height: 16px; border-radius: 3px; background: #2e2e2e; cursor: pointer;
+    }
+    .fader-vertical-wrap input[type=range]::-moz-range-track { height: 4px; background: #555; border-radius: 2px; }
+    .fader-vertical-wrap input[type=range]::-moz-range-thumb {
+      width: 16px; height: 16px; border-radius: 3px; background: #2e2e2e; border: none; cursor: pointer;
+    }
+    .sidebar-vu-meter {
+      width: 16px; height: 120px; background: rgba(0,0,0,0.45); border-radius: 6px;
+      display: flex; flex-direction: column-reverse; gap: 2px; padding: 3px; box-sizing: border-box;
+    }
+    /* Per-peer Latch talk button (see togglePeerTalk/updatePeerTalkButtons
+       in viewer.js), labeled with that peer's name: click-to-latch, blue
+       while active (same #2979ff as .btn-pgm-listen.active) per the
+       pressed-button-turns-blue convention used elsewhere. */
+    .btn-peer-talk {
+      background: #2a2a44; color: #e0e0e0; border: 2px solid #444; padding: 5px 10px;
+      border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: bold; width: 100%;
+    }
+    .btn-peer-talk:hover { border-color: #888; }
+    .btn-peer-talk.active { background: #2979ff; border-color: #2979ff; color: #fff; }
+    /* Name + stream name/g2g/Fullscreen: a normal-flow bar BELOW the video
+       (see #video-column above), not overlaid on top of it -- and
+       therefore, like the sidebar, absent while in fullscreen. Mic/Talkback
+       are the ONE exception that stay overlaid ON the video itself (see
+       #return-audio-controls below) so they keep working in fullscreen. */
+    #video-controls-bar {
+      display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 8px;
+      padding: 10px 16px; background: #16213e; border-radius: 10px;
+    }
+    #video-controls-bar .name { font-weight: bold; font-size: 16px; }
+    /* Groups Name + Mic + Talkback together on the right side of the bar
+       (original layout) -- see the HTML comment above .controls-bar-right. */
+    .controls-bar-right { display: flex; align-items: center; gap: 8px; }
+    #display-name-wrap { display: flex; align-items: center; }
+    .overlay-left { display: flex; align-items: center; }
+    .btn-disconnect { background: transparent; color: #ff5252; border: none; padding: 8px 12px; cursor: pointer; font-size: 13px; font-weight: bold; text-shadow: 0 0 4px #000; }
+    .btn-disconnect:hover { color: #ff8a80; }
+    .btn-fullscreen { background: transparent; color: #e0e0e0; border: none; padding: 8px 12px; cursor: pointer; font-size: 13px; margin-left: 4px; }
+    .btn-fullscreen:hover { color: #ffffff; }
+    /* Return audio: Mic (PGM) + Talkback. Normal (non-fullscreen) position:
+       plain inline-flow inside #video-controls-bar, next to Name/g2g/
+       Fullscreen, like the rest of that bar. While actually in fullscreen,
+       viewer.js's 'fullscreenchange' listener (see toggleFullscreen)
+       physically MOVES this element into #video-container and adds the
+       .return-audio-fs class below, turning it into a bottom-right overlay
+       ON the video itself -- otherwise it would just vanish along with the
+       rest of #video-controls-bar, since the Fullscreen API only
+       fullscreens #video-container. Moved back out (and the class removed)
+       on exit. */
+    #return-audio-controls {
+      display: none; align-items: center; gap: 8px;
+    }
+    #return-audio-controls.return-audio-fs {
+      position: absolute; bottom: 14px; right: 14px; left: auto; z-index: 2;
+      background: rgba(0,0,0,0.55); padding: 8px 12px; border-radius: 10px;
+    }
+    #display-name-input {
+      width: 100px; padding: 6px 8px; border-radius: 6px; border: 1px solid #444;
+      background: #1a1a2e; color: #e0e0e0; font-size: 12px;
+    }
+    #display-name-input:focus { border-color: #7b2ff7; outline: none; }
+    .btn-return-audio { background: #2a2a44; color: #e0e0e0; border: 2px solid #444; padding: 6px 14px; border-radius: 6px; cursor: pointer; font-size: 13px; font-weight: bold; transition: all 0.15s; user-select: none; -webkit-user-select: none; touch-action: none; }
+    .btn-return-audio:hover { border-color: #888; }
+    #btn-mic.active { background: #ff5252; border-color: #ff5252; color: #1a1a2e; }
+    #btn-talkback.active { background: #00e676; border-color: #00e676; color: #1a1a2e; }
+    /* Admin panel's per-slot PGM volume slider still uses this plain
+       horizontal style (see .admin-pgm-slot input[type=range] below); the
+       viewer-facing Retorno/per-peer sliders moved to the vertical
+       .fader-vertical-wrap style above. */
+    /* Admin panel: per-slot PGM VU meter (horizontal, reuses .vu-segment).
+       Bigger + more segments (see ADMIN_VU_SEGMENT_COUNT in viewer.js) than
+       the on-video meter, for finer resolution when watching speaker levels. */
+    .admin-vu-meter {
+      display: flex; flex-direction: row; gap: 1px; width: 160px; height: 22px;
+      background: rgba(0,0,0,0.3); border-radius: 4px; padding: 2px; box-sizing: border-box;
+    }
+    .admin-pgm-slots { margin-top: 8px; padding-left: 8px; border-left: 2px solid #333; border-radius: 6px; transition: outline-color 0.15s, box-shadow 0.15s; }
+    /* Whole-group "incoming call" box: lights up around all 3 slots (not just
+       the per-slot LED) whenever ANY commentator on this stream is actively
+       speaking on Talkback, so the admin can't miss it even if the specific
+       slot's LED is out of the corner of their eye. outline (not border) so
+       it doesn't shift the existing border-left divider or layout. */
+    .admin-pgm-slots.talkback-active { outline: 3px solid #00e676; outline-offset: 4px; box-shadow: 0 0 14px #00e676; }
+    .admin-pgm-slot { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; }
+    .admin-pgm-slot input[type=range] {
+      width: 400px; height: 4px; -webkit-appearance: none; appearance: none;
+      background: #555; border-radius: 2px; outline: none; cursor: pointer;
+    }
+    .admin-pgm-slot input[type=range]::-webkit-slider-thumb {
+      -webkit-appearance: none; appearance: none;
+      width: 13px; height: 13px; border-radius: 2px; background: #2e2e2e; cursor: pointer;
+    }
+    .admin-pgm-slot input[type=range]:disabled::-webkit-slider-thumb { background: #444; }
+    .admin-pgm-slot input[type=range]::-moz-range-track { height: 4px; background: #555; border-radius: 2px; }
+    .admin-pgm-slot input[type=range]::-moz-range-thumb {
+      width: 13px; height: 13px; border-radius: 2px; background: #2e2e2e; border: none; cursor: pointer;
+    }
+    /* Admin PGM "listen" (monitor-only, see togglePgmListen): one toggle per
+       stream's box. Active/pressed state uses blue to indicate the chosen
+       value, matching the rest of the admin panel's selected-state buttons. */
+    .btn-pgm-listen {
+      background: #2a2a44; color: #e0e0e0; border: 2px solid #444; padding: 3px 10px;
+      border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: bold;
+    }
+    .btn-pgm-listen:hover { border-color: #888; }
+    .btn-pgm-listen.active { background: #2979ff; border-color: #2979ff; color: #fff; }
+    /* Admin -> viewer private talk button (push-to-talk, see startAdminTalk). */
+    .btn-admin-talk {
+      background: #2a2a44; color: #e0e0e0; border: 2px solid #444; padding: 4px 10px;
+      border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: bold;
+      user-select: none; -webkit-user-select: none; touch-action: none;
+    }
+    .btn-admin-talk:hover:not(:disabled) { border-color: #888; }
+    .btn-admin-talk:active:not(:disabled) { background: #00e676; border-color: #00e676; color: #1a1a2e; }
+    .btn-admin-talk:disabled { opacity: 0.4; cursor: default; }
+    /* Admin -> ALL viewers private talk at once (push-to-talk, see the
+       renderPgmSlots "Hablar a los 3" button, slot='all'). Purple border to
+       stand out from the per-slot single-target buttons. */
+    .btn-admin-talk-all {
+      background: #2a2a44; color: #e0e0e0; border: 2px solid #7b2ff7; padding: 5px 12px;
+      border-radius: 6px; cursor: pointer; font-size: 12px; font-weight: bold;
+      user-select: none; -webkit-user-select: none; touch-action: none;
+    }
+    .btn-admin-talk-all:hover:not(:disabled) { border-color: #9b6bff; }
+    .btn-admin-talk-all:active:not(:disabled) { background: #00e676; border-color: #00e676; color: #1a1a2e; }
+    .btn-admin-talk-all:disabled { opacity: 0.4; cursor: default; }
+    /* Per-commentator Talkback LED (see renderPgmSlots's talkbackDot): lit
+       green only while THAT SPECIFIC slot's occupant is actively speaking
+       on Talkback, dim gray otherwise. */
+    .talkback-led {
+      width: 9px; height: 9px; border-radius: 50%; flex-shrink: 0;
+      display: inline-block; background: #444; transition: background 0.15s, box-shadow 0.15s;
+    }
+    .talkback-led.lit { background: #00e676; box-shadow: 0 0 6px #00e676; }
+    .no-streams { text-align: center; padding: 60px; color: #666680; }
+    button { background: #7b2ff7; color: white; border: none; padding: 8px 16px; border-radius: 6px; cursor: pointer; font-size: 13px; }
+    button:hover { background: #6a25d0; }
+    #viewers { font-size: 13px; color: #00c9db; }
+    /* Click-to-unmute: now lives in #sidebar-controls, right after the
+       Retorno box (see selectStream/disconnectStream in viewer.js). Fixed
+       size icon-only button -- showing the state as text ("Click to
+       unmute"/"Audio on") made the button's width change, which shifted the
+       whole sidebar (and therefore the video next to it, see #video-column)
+       every time it toggled. The state is still available as a tooltip. */
+    #mute-hint {
+      display: flex; align-items: center; justify-content: center;
+      width: 40px; height: 40px; margin: 0 auto; font-size: 20px;
+      color: #a0a0b8; cursor: pointer; border-radius: 8px; background: rgba(255,255,255,0.06);
+    }
+    #mute-hint:hover { background: rgba(255,255,255,0.14); color: #e0e0e0; }
+  </style>
+</head>
+<body>
+  <!-- Login screen -->
+  <div id="login-screen" style="display:flex; justify-content:center; align-items:center; height:100vh;">
+    <div style="background:#16213e; padding:40px; border-radius:16px; width:340px; text-align:center;">
+      <h2 style="margin-bottom:20px;">Winus Video</h2>
+      <input id="login-user" type="text" placeholder="Username"
+        style="width:100%; padding:10px; margin:6px 0; border-radius:6px; border:1px solid #333; background:#1a1a2e; color:#e0e0e0; font-size:14px;">
+      <input id="login-pass" type="password" placeholder="Password"
+        style="width:100%; padding:10px; margin:6px 0; border-radius:6px; border:1px solid #333; background:#1a1a2e; color:#e0e0e0; font-size:14px;"
+        onkeydown="if(event.key==='Enter')doLogin()">
+      <div id="login-error" style="color:#ff5252; font-size:12px; min-height:18px; margin:6px 0;"></div>
+      <button onclick="doLogin()" style="width:100%; padding:12px; font-size:15px; font-weight:bold;">Login</button>
+    </div>
+  </div>
+
+  <!-- Main screen (hidden until login) -->
+  <div id="main-screen" style="display:none;">
+  <div class="header">
+    <h1>Winus Video</h1>
+    <span class="badge">LIVE</span>
+    <span id="viewers">0 viewers</span>
+    <button id="btn-admin" onclick="toggleAdmin()" style="margin-left:auto; background:#7b2ff7; font-size:12px; padding:4px 12px; display:none;">Users</button>
+    <button onclick="logout()" style="background:#ff5252; font-size:12px; padding:4px 12px; margin-left:8px;">Logout</button>
+  </div>
+  <div class="container">
+    <div id="status" class="status-connecting">Connecting...</div>
+    <div id="stream-list" class="stream-list"></div>
+    <div id="video-sidebar-layout">
+    <div id="video-column">
+    <div id="video-container">
+      <video id="main-video" autoplay muted playsinline></video>
+      <div id="video-top-center-overlay">
+        <div id="onair-badge">
+          <span id="onair-led"></span>
+          <span class="onair-text">ON AIR</span>
+        </div>
+      </div>
+      <div id="video-top-overlay">
+        <button id="btn-disconnect" class="btn-disconnect" onclick="disconnectStream()" style="display:none;">■ Disconnect</button>
+      </div>
+      <div id="vu-meter" title="Nivel de audio de retorno (PGM/Talkback)"></div>
+    </div>
+    <!-- Name/stream name/g2g/Fullscreen/Mic/Talkback: fuera del video en modo
+         normal (aquí es donde deben estar "bien situados"). Al entrar en
+         pantalla completa (que sólo fullscreena #video-container), un
+         listener de 'fullscreenchange' en viewer.js MUEVE #return-audio-controls
+         (Mic/Talkback) dentro de #video-container como overlay abajo a la
+         derecha, y lo devuelve aquí al salir -- ver el listener junto a
+         toggleFullscreen() en viewer.js. Todo lo demás de esta barra
+         desaparece en fullscreen sin lógica adicional. -->
+    <div id="video-controls-bar">
+      <div class="overlay-left">
+        <span id="video-name" class="name"></span>
+        <span id="latency" style="font-size:12px; color:#00c9db; margin-left:12px;"></span>
+        <!-- HLS link (WebOS/Smart TV playback, see hls.html): every logged-in
+             role except guest-link/commentator sessions can generate it (see
+             copyHlsLink in viewer.js) -- shown/hidden by the same
+             !streamLocked condition already used for #btn-disconnect. -->
+        <button id="btn-hls-link" class="btn-fullscreen" onclick="copyHlsLink(activeStreamId)" style="display:none;" title="Copiar enlace HLS (para reproducir en Smart TV/WebOS)">📺 HLS</button>
+        <button class="btn-fullscreen" onclick="toggleFullscreen()">⛶ Fullscreen</button>
+      </div>
+      <!-- Name + Mic + Talkback grouped together on the right, in that order
+           (original layout). #display-name-wrap and #return-audio-controls
+           stay separate elements (not merged into one) because
+           #return-audio-controls alone gets physically relocated into the
+           video on fullscreen -- see the 'fullscreenchange' listener next to
+           toggleFullscreen() in viewer.js -- while the name input must NOT
+           move with it. -->
+      <div class="controls-bar-right">
+        <span id="display-name-wrap">
+          <input id="display-name-input" type="text" placeholder="Tu nombre" maxlength="30"
+            oninput="setDisplayName(this.value)" title="Así te verá el admin en PGM">
+        </span>
+        <div id="return-audio-controls">
+          <button id="btn-mic" class="btn-return-audio" onclick="toggleMic()" title="Mic OFF">🎙 Mic</button>
+          <button id="btn-talkback" class="btn-return-audio" onclick="toggleTalkback()"
+            title="Talkback (click para activar/desactivar)">📞 Talkback</button>
+        </div>
+      </div>
+    </div>
+    </div>
+    <!-- Al costado del video: caja "Retorno" (audio que envía el publisher,
+         antes el slider horizontal + vúmetro izquierdo sobre el video), el
+         click-to-unmute, y una caja por cada otro comentarista PGM activo
+         (nombre + fader + vúmetro + "Hablar" en Latch). Ver renderPeerSidebar()
+         en viewer.js. Queda FUERA de #video-container a propósito: al entrar
+         en pantalla completa (que sólo fullscreena #video-container) esta
+         sidebar desaparece sola, sin lógica adicional. -->
+    <div id="sidebar-controls">
+      <div id="retorno-box" class="sidebar-box" style="display:none;">
+        <span class="sidebar-box-name">🔊 Retorno</span>
+        <div class="sidebar-box-fader-row">
+          <div class="fader-vertical-wrap">
+            <input type="range" min="0" max="100" value="100" oninput="setPlaybackVolume(this.value/100)" title="Volumen del audio entrante">
+          </div>
+          <div id="vu-meter-incoming" class="sidebar-vu-meter" title="Nivel de audio entrante (publisher)"></div>
+        </div>
+      </div>
+      <span id="mute-hint" title="Click to unmute">🔇</span>
+      <div id="peer-sidebar-boxes"></div>
+    </div>
+    </div>
+    <div id="no-streams" class="no-streams">No active streams</div>
+
+    <!-- Admin panel -->
+    <div id="admin-panel" style="display:none; margin-top:20px;">
+      <div style="background:#16213e; border-radius:12px; padding:20px; margin-bottom:20px;">
+        <h3 style="margin:0 0 12px;">Streams</h3>
+        <div id="admin-stream-list"></div>
+      </div>
+      <div id="user-mgmt-panel" style="background:#16213e; border-radius:12px; padding:20px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+          <h3 style="margin:0;">User Management</h3>
+          <button onclick="resetServer()" style="background:#ff5252; margin-right:8px;">⟲ Reset Server</button>
+          <button onclick="showAddUser()">+ Add User</button>
+        </div>
+        <div id="add-user-form" style="display:none; background:#1a1a2e; padding:12px; border-radius:8px; margin-bottom:12px;">
+          <input id="new-username" placeholder="Username" style="padding:6px 10px; border-radius:4px; border:1px solid #333; background:#16213e; color:#e0e0e0; margin-right:6px;">
+          <input id="new-password" type="password" placeholder="Password" style="padding:6px 10px; border-radius:4px; border:1px solid #333; background:#16213e; color:#e0e0e0; margin-right:6px;">
+          <select id="new-role" style="padding:6px 10px; border-radius:4px; border:1px solid #333; background:#16213e; color:#e0e0e0; margin-right:6px;">
+            <option value="viewer">Viewer</option>
+            <option value="publisher">Publisher</option>
+            <option value="admin">Admin</option>
+          </select>
+          <button onclick="addUser()">Create</button>
+          <button onclick="document.getElementById('add-user-form').style.display='none'" style="background:#666;">Cancel</button>
+        </div>
+        <div id="user-list"></div>
+      </div>
+    </div>
+  </div>
+  </div><!-- /main-screen -->
+  <script src="mediasoup-client.min.js?v=40"></script>
+  <script src="viewer.js?v=40"></script>
+</body>
+</html>
