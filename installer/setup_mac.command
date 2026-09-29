@@ -7,6 +7,21 @@
 
 trap 'echo ""; echo "❌ Error en la instalación. Revisa los mensajes arriba."; echo ""; read -p "Presiona Enter para cerrar..."; exit 1' ERR
 
+# ---- Sanitize PATH ----
+# Macs migrated/restored from an older Intel Mac often carry over several
+# old package managers ahead of the safe system directories on PATH --
+# MacPorts at /opt/local, Intel Homebrew at /usr/local, pyenv/conda shims,
+# etc. Virtually everything under those old prefixes is x86_64, and fresh
+# Apple Silicon Macs frequently don't have Rosetta 2 installed at all
+# (it's opt-in, on demand), so invoking ANY of them -- even something as
+# basic as `clear` -- fails immediately with "Bad CPU type in executable".
+# Reset to a minimal, known-safe PATH before running anything else: Apple's
+# own /usr/bin, /bin, /usr/sbin, /sbin only ever contain universal binaries
+# (always safe to run), and /opt/homebrew is where THIS installer puts
+# everything it manages (see step 1 below, which installs Homebrew there
+# if missing).
+export PATH="/opt/homebrew/bin:/opt/homebrew/sbin:/usr/bin:/bin:/usr/sbin:/sbin"
+
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP_NAME="Winus Video Publisher"
 VENV_DIR="$SCRIPT_DIR/.venv"
@@ -62,23 +77,41 @@ if [ ! -f "$SCRIPT_DIR/tools/publish.js" ]; then
 fi
 
 # ---- 1. Homebrew ----
+# IMPORTANT: check specifically for /opt/homebrew/bin/brew (the ONLY valid
+# Homebrew prefix on Apple Silicon), NOT just "is there some brew on PATH".
+# Macs migrated/restored from an older Intel Mac (Migration Assistant, Time
+# Machine, etc.) commonly still have a leftover Intel Homebrew at
+# /usr/local/bin/brew, which `command -v brew` happily finds first. If we
+# trusted that, every `brew install` below would silently install x86_64
+# formulas -- and since fresh Apple Silicon Macs frequently DON'T have
+# Rosetta 2 installed (it's opt-in on demand), actually running any of
+# those x86_64 binaries (node, gst-launch-1.0, etc.) fails immediately with
+# "Bad CPU type in executable". So: always install/use the ARM-native
+# Homebrew at /opt/homebrew, regardless of what else happens to be on PATH.
 echo "▸ [1/7] Verificando Homebrew..."
-if ! command -v brew &>/dev/null; then
-    echo "  Instalando Homebrew (puede pedir tu contraseña)..."
+if command -v brew &>/dev/null && [ "$(command -v brew)" != "/opt/homebrew/bin/brew" ]; then
+    echo "  [!] Se detectó un Homebrew distinto en $(command -v brew) (probablemente Intel, de"
+    echo "      una Mac anterior). En Apple Silicon solo /opt/homebrew es válido -- este"
+    echo "      instalador lo ignora y usa/instala el propio de /opt/homebrew."
+fi
+if [ ! -x /opt/homebrew/bin/brew ]; then
+    echo "  Instalando Homebrew para Apple Silicon (puede pedir tu contraseña)..."
     /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
-    if [ -f /opt/homebrew/bin/brew ]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-        SHELL_PROFILE="$HOME/.zprofile"
-        if ! grep -q 'homebrew' "$SHELL_PROFILE" 2>/dev/null; then
-            echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$SHELL_PROFILE"
-        fi
-    fi
     echo "  ✓ Homebrew instalado"
 else
-    if [ -f /opt/homebrew/bin/brew ]; then
-        eval "$(/opt/homebrew/bin/brew shellenv)"
-    fi
     echo "  ✓ Homebrew OK"
+fi
+if [ ! -x /opt/homebrew/bin/brew ]; then
+    echo "❌ No se pudo instalar Homebrew en /opt/homebrew."
+    read -p "Presiona Enter para cerrar..."
+    exit 1
+fi
+# Prepend /opt/homebrew/bin ahead of anything else on PATH (e.g. a stale
+# /usr/local/bin) for the REST of this script's execution.
+eval "$(/opt/homebrew/bin/brew shellenv)"
+SHELL_PROFILE="$HOME/.zprofile"
+if ! grep -q 'opt/homebrew' "$SHELL_PROFILE" 2>/dev/null; then
+    echo 'eval "$(/opt/homebrew/bin/brew shellenv)"' >> "$SHELL_PROFILE"
 fi
 
 # ---- 2. System dependencies ----
@@ -142,9 +175,17 @@ echo "  ✓ Node.js: $(node --version)"
 echo "▸ [3/7] Configurando entorno Python..."
 if [ -d "$VENV_DIR" ]; then
     VENV_PY_VER=$("$VENV_DIR/bin/python3" --version 2>/dev/null || echo "none")
+    # Also check the venv's own architecture, not just its version number --
+    # a .venv created by an earlier run (e.g. before this installer correctly
+    # ignored a leftover Intel Homebrew, see step 1 above) can report the
+    # exact same "Python 3.12" version string while actually being an x86_64
+    # interpreter, which then fails every import/run with "Bad CPU type in
+    # executable" on a Mac without Rosetta -- the version check alone can't
+    # catch that, so recreate whenever either check fails.
+    VENV_PY_ARCH=$("$VENV_DIR/bin/python3" -c 'import platform; print(platform.machine())' 2>/dev/null || echo "none")
     EXPECTED_MINOR=$(echo "$PYVER" | cut -d. -f2)
-    if [[ "$VENV_PY_VER" != *"3.${EXPECTED_MINOR}"* ]]; then
-        echo "  Recreando entorno para Python $PYVER..."
+    if [[ "$VENV_PY_VER" != *"3.${EXPECTED_MINOR}"* ]] || [ "$VENV_PY_ARCH" != "arm64" ]; then
+        echo "  Recreando entorno (Python $PYVER / arm64 requerido, había: $VENV_PY_VER / $VENV_PY_ARCH)..."
         rm -rf "$VENV_DIR"
     fi
 fi
