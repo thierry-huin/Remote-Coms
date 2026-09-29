@@ -6,6 +6,17 @@ module.exports = {
     rtcMaxPort: parseInt(process.env.RTP_MAX_PORT || '10400', 10),
     logLevel: 'warn',
     logTags: ['info', 'ice', 'dtls', 'rtp', 'srtp'],
+    // Docker/containerd disables the io_uring syscalls by default (security
+    // hardening, see https://github.com/containerd/containerd/issues/9048).
+    // mediasoup-worker >= 3.14.0 auto-detects kernel >= 6 and tries to use
+    // io_uring regardless, which crashes with "io_uring_queue_init() failed:
+    // Operation not permitted" (worker exits with code:40) the moment a
+    // Router/Producer is created inside such a container -- exactly what
+    // happened in production (kernel 6.17 host, default Docker seccomp).
+    // Explicitly disabling liburing avoids depending on the container's
+    // seccomp profile at all (the officially recommended fix, see
+    // https://github.com/versatica/mediasoup/issues/1435).
+    disableLiburing: true,
   },
   // One worker per CPU core (video is heavier than audio)
   numWorkers: Math.min(os.cpus().length, 4),
