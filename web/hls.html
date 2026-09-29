@@ -28,12 +28,27 @@
     font-family: system-ui, sans-serif; font-size: 26px; color: #a0a0b8; text-align: center;
     padding: 40px; z-index: 3;
   }
+  /* Shown only when the browser's autoplay policy forced us to start muted
+     (see attachHls/tryPlay below) -- most desktop browsers (Chrome, Safari)
+     block autoplay WITH sound unless the user already interacted with the
+     page, so we fall back to muted+autoplay and surface this big, remote
+     control/click/tap-friendly button to turn sound on. Smart TV browsers
+     (WebOS) are generally more lenient and often never show this at all. */
+  #unmute-btn {
+    position: absolute; left: 50%; bottom: 8%; transform: translateX(-50%);
+    display: none; align-items: center; gap: 10px;
+    font-family: system-ui, sans-serif; font-size: 22px; font-weight: bold;
+    color: #fff; background: rgba(20,20,30,0.85); border: 2px solid #fff;
+    border-radius: 999px; padding: 14px 28px; cursor: pointer; z-index: 4;
+  }
+  #unmute-btn:focus { outline: 3px solid #4da3ff; }
 </style>
 </head>
 <body>
-  <video id="video" autoplay muted playsinline></video>
+  <video id="video" autoplay playsinline></video>
   <div id="overlay-name"></div>
   <div id="overlay-clock"></div>
+  <button id="unmute-btn" type="button">🔊 Activar sonido</button>
   <div id="message">Cargando...</div>
   <script src="hls.min.js"></script>
   <script>
@@ -44,6 +59,32 @@
     const overlayName = document.getElementById('overlay-name');
     const overlayClock = document.getElementById('overlay-clock');
     const messageEl = document.getElementById('message');
+    const unmuteBtn = document.getElementById('unmute-btn');
+
+    unmuteBtn.addEventListener('click', () => {
+      video.muted = false;
+      video.play().catch(() => {});
+      unmuteBtn.style.display = 'none';
+    });
+
+    // Try to autoplay WITH sound first (works on most Smart TV browsers,
+    // including WebOS). If the browser's autoplay policy rejects that
+    // (typical on desktop Chrome/Safari -- NotAllowedError), fall back to
+    // muted autoplay and show the tap/click-to-unmute button so the viewer
+    // can turn sound on with one click/remote press instead of silently
+    // playing muted forever.
+    function tryPlay() {
+      video.muted = false;
+      const p = video.play();
+      if (p && p.catch) {
+        p.catch(() => {
+          video.muted = true;
+          video.play().catch(() => {});
+          unmuteBtn.style.display = 'flex';
+          unmuteBtn.focus();
+        });
+      }
+    }
 
     const RETRY_MS = 5000;
     let hls = null;
@@ -85,7 +126,7 @@
         showMessage('Este navegador no soporta HLS.');
         return;
       }
-      video.play().catch(() => {});
+      tryPlay();
       hideMessage();
     }
 
