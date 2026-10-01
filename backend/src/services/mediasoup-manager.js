@@ -144,15 +144,43 @@ async function publishStream(streamId, { transport, kind, rtpParameters, metadat
   // from the start (HLS_ENABLED=1) and the video Producer happens to land
   // first, the auto-restart above used to fire with `stream.audioProducer`
   // still unset, permanently starting that HLS session video-only -- there
-  // was no later trigger to pick up audio once it showed up. `_restartHlsFor`
-  // is idempotent (startHls always stops any previous session first), so
-  // it's safe to call again here once both producers are known.
+  // was no later trigger to pick up audio once it showed up.
   if (hlsWanted.has(streamId) && existing.producer && (kind === 'video' || kind === 'audio')) {
-    _restartHlsFor(streamId).catch((err) =>
-      console.error(`[HLS] ${streamId}: auto-restart failed: ${err.message}`));
+    _scheduleHlsRestart(streamId);
   }
 
   return { producerId: producer.id };
+}
+
+// streamId -> debounce timer (see _scheduleHlsRestart).
+const hlsRestartTimers = new Map();
+
+// Debounces publishStream()'s auto-restart: video and audio Producers show
+// up as two separate publishStream() calls a few tens of ms apart (per
+// production logs). Calling _restartHlsFor() immediately on EACH one used
+// to start a (real, if short-lived) video-only HLS session that got
+// stop+restarted moments later once audio showed up -- which, even though
+// hlssink2 continues the SAME playlist/segment numbering across that
+// restart, still means a brand new gst-launch process (fresh PTS/PCR base,
+// fresh MPEG-TS PAT/PMT) resumes writing into the middle of an existing,
+// un-flagged playlist with no #EXT-X-DISCONTINUITY tag. Players that are
+// stricter about timeline continuity than our own gst-discoverer spot
+// check (which only validated a single segment in isolation) can choke on
+// that -- consistent with the black frame on WebOS and VLC stopping dead
+// that showed up only after the audio-race fix started making this
+// restart happen on essentially every single stream start. Debouncing
+// collapses the near-simultaneous video+audio arrivals into a SINGLE
+// _restartHlsFor() call, so the common case now starts HLS exactly once,
+// already with both tracks. For a genuinely video-only stream (e.g. no
+// mic connected), 500ms is just a harmless fixed delay before that first
+// (and only) start.
+function _scheduleHlsRestart(streamId) {
+  clearTimeout(hlsRestartTimers.get(streamId));
+  hlsRestartTimers.set(streamId, setTimeout(() => {
+    hlsRestartTimers.delete(streamId);
+    _restartHlsFor(streamId).catch((err) =>
+      console.error(`[HLS] ${streamId}: auto-restart failed: ${err.message}`));
+  }, 500));
 }
 
 async function _restartHlsFor(streamId) {
@@ -183,6 +211,10 @@ async function setHlsEnabled(streamId, enabled) {
 function unpublishStream(streamId) {
   const stream = streams.get(streamId);
   if (!stream) return;
+  // Cancel any pending debounced HLS (re)start scheduled by publishStream
+  // above -- the Producers it would have used are about to be closed.
+  clearTimeout(hlsRestartTimers.get(streamId));
+  hlsRestartTimers.delete(streamId);
   try { stream.producer?.close(); } catch (_) {}
   try { stream.plainTransport?.close(); } catch (_) {}
   try { stream.audioProducer?.close(); } catch (_) {}
