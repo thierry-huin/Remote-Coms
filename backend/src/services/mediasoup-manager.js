@@ -200,7 +200,18 @@ async function _restartHlsFor(streamId) {
 async function setHlsEnabled(streamId, enabled) {
   if (enabled) {
     hlsWanted.add(streamId);
-    await _restartHlsFor(streamId);
+    // Debounced (same as publishStream's auto-restart, see
+    // _scheduleHlsRestart) rather than an immediate `await _restartHlsFor`:
+    // publish.js calls this right at WS-connect time whenever HLS_ENABLED=1,
+    // which typically lands BETWEEN the video and audio Producers being
+    // published (confirmed in production logs: an immediate call here
+    // fired a video-only HLS start ~46ms after the video Producer, racing
+    // right past this exact debounce when audio arrived through the OTHER
+    // call site a moment later). Without debouncing here too, this second
+    // entry point into _restartHlsFor() reintroduces the same video-only
+    // -then-restart mid-playlist discontinuity the debounce was meant to
+    // eliminate.
+    _scheduleHlsRestart(streamId);
   } else {
     hlsWanted.delete(streamId);
     hlsManager.stopHls(streamId);
