@@ -117,7 +117,19 @@ async function startHls(streamId, router, videoProducer, audioProducer, key) {
     'hlssink2', 'name=hlssink',
     `location=${path.join(dir, 'segment%05d.ts')}`,
     `playlist-location=${path.join(dir, 'playlist.m3u8')}`,
-    'target-duration=2', 'playlist-length=6', 'max-files=8',
+    // playlist-length/max-files used to be 6/8 -- with segments actually
+    // landing around ~1s each (hlssink2 cuts on keyframe boundaries, so
+    // real duration tracks the publisher's keyframe interval, not this
+    // target-duration hint), that only kept 6-8 SECONDS of video on disk.
+    // Confirmed in the field: WebOS stuck on a black frame and VLC quitting
+    // immediately, both consistent with the player's first few segment
+    // fetches 404ing because totally normal startup/network/TLS latency
+    // (a few seconds) was enough for the manifest's oldest segments to
+    // already be rotated out and deleted before the player could GET them.
+    // Widening the window trades a bit more live latency (a handful of
+    // extra seconds, fine for passive TV viewing) for not racing every
+    // single player's startup against our own segment-deletion clock.
+    'target-duration=2', 'playlist-length=12', 'max-files=20',
     'udpsrc', `port=${videoPort}`, `caps=${rtpCapsFor('video', videoConsumer.rtpParameters)}`,
     '!', 'rtpjitterbuffer', '!', 'rtph264depay', '!', 'h264parse', 'config-interval=-1',
     '!', 'hlssink.video',
