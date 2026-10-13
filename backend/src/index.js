@@ -145,11 +145,10 @@ async function main() {
   // otherwise have no admin-ish capability anywhere else in this app. This
   // is the one thing a 'viewer' account may do beyond just watching. It does
   // NOT let a viewer turn HLS on/off -- that stays a publisher-only action
-  // (see the WS 'setHlsEnabled' case), the link just won't resolve to a live
-  // feed (see /api/hls-info below) until the publisher's own "HLS" checkbox
-  // is on. Points at the static web/hls.html wrapper page (which renders the
-  // stream-name + clock overlay in plain HTML/CSS), never at the raw .m3u8
-  // itself, so a TV always gets that overlay.
+  // (see the WS 'setHlsEnabled' case), the link just won't resolve (404 at
+  // nginx) until the publisher's own "HLS" checkbox is on. Points DIRECTLY
+  // at the raw nginx-served .m3u8 (no web/hls.html wrapper/overlay) -- a TV
+  // that can't do WebRTC gets exactly the HLS stream, no clock/name overlay.
   const hlsLinkAuth = authMiddleware(['admin', 'superadmin', 'publisher', 'viewer']);
   function buildHlsLinkUrl(req, streamId, key) {
     const externalIp = process.env.EXTERNAL_IP;
@@ -157,7 +156,7 @@ async function main() {
     const host = externalIp
       ? (httpsPort === '443' ? externalIp : `${externalIp}:${httpsPort}`)
       : req.get('host');
-    return `https://${host}/hls.html?s=${encodeURIComponent(streamId)}&k=${encodeURIComponent(key)}`;
+    return `https://${host}/hls/${encodeURIComponent(key)}/playlist.m3u8`;
   }
 
   app.get('/api/streams/:streamId/hls-link', hlsLinkAuth, requireStreamOwnership, (req, res) => {

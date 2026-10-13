@@ -13,7 +13,13 @@
  * process per stream:
  *   - Video: PASSTHROUGH remux only (h264parse, no decode/re-encode) --
  *     the H264 bytes are already encoded for WebRTC, so this costs
- *     essentially nothing.
+ *     essentially nothing. A server-side re-encode (x264enc) was tried to
+ *     chase compatibility with one specific Smart TV's native decoder, but
+ *     was reverted by design decision: the publisher's encode settings
+ *     can't change (would hurt its processing speed), and recoding costs
+ *     real server CPU for a benefit that only helps some problem devices.
+ *     If the publisher outputs 25p/30p, HLS works broadly as-is; 50p/60p
+ *     may simply not work on every device, which is an accepted tradeoff.
  *   - Audio: Opus -> AAC transcode (voaacenc) -- unavoidable, since HLS/TV
  *     playback overwhelmingly expects AAC, not Opus. Cheap (audio-only).
  *   - hlssink2 (confirmed available in this image's gstreamer1.0-plugins-bad;

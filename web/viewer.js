@@ -118,9 +118,49 @@ let displayName = localStorage.getItem('winus-display-name') || '';
 // Built lazily in ensureReturnProducers().
 let pgmAnalyser = null, talkbackAnalyser = null;
 let audioCtx = null;
-// Volume of the incoming audio from the publisher (what the viewer hears),
-// applied directly to the <video> element. See setPlaybackVolume().
+// Volume of the incoming audio from the publisher (what the viewer hears).
+// See setPlaybackVolume()/attachPlaybackAudio() -- NOT applied via
+// video.volume (see those functions' comments for why).
 let playbackVolume = 1.0;
+// Whether the viewer has muted the incoming audio via the speaker icon (see
+// selectStream's #mute-hint handler). Kept as its own flag, separate from
+// video.muted -- the <video> element's OWN audio output is now permanently
+// muted (see attachPlaybackAudio below); actual audibility is governed
+// solely by playbackGainNode.gain, which this flag controls.
+let playbackMuted = true;
+// Web Audio graph for the incoming audio: iOS WebKit (Safari AND "Chrome"
+// on iOS -- Apple forces every iOS browser onto WebKit's engine) silently
+// ignores HTMLMediaElement.volume entirely -- the slider visibly moves
+// (it's a plain <input type=range>, unrelated to media playback) but the
+// audible level never changes. This is intentional Apple policy (volume is
+// meant to be hardware-buttons-only there), not a bug.
+// Tapping the raw incoming AUDIO TRACK directly via createMediaStreamSource
+// -- the exact same technique setupIncomingVuMeter()/tapAnalyser() already
+// use successfully for the VU meters -- works on iOS (confirmed in the
+// field), unlike an earlier createMediaElementSource-on-the-<video> attempt.
+// The <video> element is muted PERMANENTLY (see selectStream) and used for
+// its video frames only; all actual audio playback happens through this
+// separate graph instead.
+let playbackSourceNode = null, playbackGainNode = null;
+function attachPlaybackAudio(audioTrack) {
+  teardownPlaybackAudio();
+  if (!audioTrack) return;
+  try {
+    const ctx = getAudioCtx();
+    playbackSourceNode = ctx.createMediaStreamSource(new MediaStream([audioTrack]));
+    playbackGainNode = ctx.createGain();
+    playbackGainNode.gain.value = playbackMuted ? 0 : playbackVolume;
+    playbackSourceNode.connect(playbackGainNode).connect(ctx.destination);
+  } catch (err) {
+    console.warn('No se pudo crear el grafo de Web Audio para el audio entrante:', err);
+  }
+}
+function teardownPlaybackAudio() {
+  try { playbackSourceNode?.disconnect(); } catch (_) {}
+  try { playbackGainNode?.disconnect(); } catch (_) {}
+  playbackSourceNode = null;
+  playbackGainNode = null;
+}
 
 // ── Incoming-audio VU meter (mono) ──
 // Purely a monitor tap on the publisher's audio track (never connected to
@@ -490,8 +530,16 @@ async function selectStream(streamId) {
     const video = document.getElementById('main-video');
     video.srcObject = new MediaStream(tracks);
     const hasAudio = tracks.some(t => t.kind === 'audio');
+    // Permanently muted: actual audio now plays ONLY through the separate
+    // Web Audio graph below (see attachPlaybackAudio) -- leaving this
+    // unmuted would double up audio (once natively, once via Web Audio).
     video.muted = true;
-    video.volume = playbackVolume;
+    video.volume = playbackVolume; // inert now, kept only as a harmless fallback
+    // Reset to muted on every stream switch, same as a fresh page load --
+    // without this, a newly-selected stream would start audible if a
+    // previous one had been unmuted/turned up.
+    playbackMuted = true;
+    attachPlaybackAudio(hasAudio ? tracks.find(t => t.kind === 'audio') : null);
     video.play().catch(() => {});
     // "Retorno" sidebar box (fader + VU meter for the audio arriving FROM
     // the publisher) -- see #retorno-box/#sidebar-controls in index.html.
@@ -506,9 +554,10 @@ async function selectStream(streamId) {
     // changes and can't shift the sidebar/video layout next to it.
     const muteHint = document.getElementById('mute-hint');
     muteHint.onclick = () => {
-      video.muted = !video.muted;
-      muteHint.textContent = video.muted ? '🔇' : '🔊';
-      muteHint.title = video.muted ? 'Click to unmute' : 'Audio on';
+      playbackMuted = !playbackMuted;
+      if (playbackGainNode) playbackGainNode.gain.value = playbackMuted ? 0 : playbackVolume;
+      muteHint.textContent = playbackMuted ? '🔇' : '🔊';
+      muteHint.title = playbackMuted ? 'Click to unmute' : 'Audio on';
     };
     const label = lastStreams.find(s => s.streamId === streamId);
     document.getElementById('video-name').textContent = label?.streamName || streamId;
@@ -617,6 +666,7 @@ function disconnectStream() {
   stopLatencyMonitor();
   resetReturnAudio();
   teardownIncomingVuMeter();
+  teardownPlaybackAudio();
   document.querySelectorAll('.stream-btn').forEach(btn => btn.className = 'stream-btn');
 }
 
@@ -697,11 +747,16 @@ function tapAnalyser(stream) {
 }
 
 // Volume of the incoming audio (what arrives FROM the publisher), not the
-// mic/return audio sent TO it. Applied straight to the <video> element.
+// mic/return audio sent TO it. Drives the Web Audio gain node (works on
+// iOS, see attachPlaybackAudio) -- also sets video.volume as a harmless,
+// inert fallback (the <video> element itself is permanently muted).
 function setPlaybackVolume(value) {
   playbackVolume = Math.min(1, Math.max(0, parseFloat(value) || 0));
   const video = document.getElementById('main-video');
   if (video) video.volume = playbackVolume;
+  // Don't fight an active mute: only push the new level through if currently
+  // unmuted, same as how the mute button itself drives this gain node.
+  if (playbackGainNode && !playbackMuted) playbackGainNode.gain.value = playbackVolume;
 }
 
 // Ensures exactly the ONE producer needed for `kind` ('pgm' or 'talkback').
@@ -1068,10 +1123,6 @@ async function consumePgmPeerSlot(slot) {
     const audioEl = document.createElement('audio');
     audioEl.autoplay = true;
     audioEl.style.display = 'none';
-    // Re-apply whatever volume WE previously set for this slot (see
-    // renderPeerSidebar) -- otherwise a brief reconnect of that peer would
-    // silently reset our own adjustment back to 100%.
-    audioEl.volume = pgmPeerVolumes.has(slot) ? pgmPeerVolumes.get(slot) : 1;
     audioEl.srcObject = new MediaStream([consumer.track]);
     document.body.appendChild(audioEl);
     audioEl.play().catch(() => {
@@ -1081,19 +1132,30 @@ async function consumePgmPeerSlot(slot) {
       document.addEventListener('click', retry);
     });
     // Monitor-only tap (see tapAnalyser) so the peer's sidebar box can show
-    // its own VU meter (see startVuMeterLoop) -- purely a level reading,
-    // never connected to any output (the actual playback is audioEl above).
-    let analyser = null, analyserSource = null;
+    // its own VU meter (see startVuMeterLoop), AND -- same iOS fix as the
+    // main "Retorno" fader (see attachPlaybackAudio) -- the ACTUAL audible
+    // playback for this peer: audioEl itself is muted below and a GainNode
+    // off the same source feeds ctx.destination instead, since iOS ignores
+    // HTMLMediaElement.volume entirely.
+    let analyser = null, analyserSource = null, gainNode = null;
     try {
       const ctx = getAudioCtx();
       analyserSource = ctx.createMediaStreamSource(new MediaStream([consumer.track]));
       analyser = ctx.createAnalyser();
       analyser.fftSize = 512;
       analyserSource.connect(analyser);
+      gainNode = ctx.createGain();
+      gainNode.gain.value = pgmPeerVolumes.has(slot) ? pgmPeerVolumes.get(slot) : 1;
+      analyserSource.connect(gainNode).connect(ctx.destination);
+      audioEl.muted = true; // real output now comes from gainNode above
     } catch (err) {
-      console.warn(`No se pudo iniciar el vúmetro del comentarista del slot ${slot}:`, err);
+      console.warn(`No se pudo iniciar el audio/vúmetro del comentarista del slot ${slot}:`, err);
+      // Fallback: let the hidden <audio> element play natively (works
+      // everywhere except iOS -- better than total silence if Web Audio
+      // itself is unavailable).
+      audioEl.volume = pgmPeerVolumes.has(slot) ? pgmPeerVolumes.get(slot) : 1;
     }
-    pgmPeerAudioEls.set(slot, { consumer, audioEl, analyser, analyserSource });
+    pgmPeerAudioEls.set(slot, { consumer, audioEl, analyser, analyserSource, gainNode });
     renderPeerSidebar();
   } catch (err) {
     console.error(`No se pudo escuchar al comentarista del slot ${slot}:`, err);
@@ -1106,6 +1168,7 @@ function stopPgmPeerSlot(slot) {
   try { entry.consumer.close(); } catch (_) {}
   try { entry.audioEl.pause(); entry.audioEl.srcObject = null; entry.audioEl.remove(); } catch (_) {}
   try { entry.analyserSource?.disconnect(); } catch (_) {}
+  try { entry.gainNode?.disconnect(); } catch (_) {}
   pgmPeerAudioEls.delete(slot);
   renderPeerSidebar();
 }
@@ -1118,7 +1181,12 @@ function setPgmPeerVolume(slot, value) {
   value = Math.min(1, Math.max(0, value));
   pgmPeerVolumes.set(slot, value);
   const entry = pgmPeerAudioEls.get(slot);
-  if (entry) entry.audioEl.volume = value;
+  if (!entry) return;
+  // Normal path: drive the GainNode (works on iOS). Fallback path (Web
+  // Audio unavailable, see consumePgmPeerSlot's catch): audioEl itself is
+  // the one actually playing, unmuted, so adjust its native volume instead.
+  if (entry.gainNode) entry.gainNode.gain.value = value;
+  else entry.audioEl.volume = value;
 }
 
 // Admin -> viewer private talk (admin side): push-to-talk (mousedown/mouseup

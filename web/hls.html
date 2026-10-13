@@ -42,6 +42,15 @@
     border-radius: 999px; padding: 14px 28px; cursor: pointer; z-index: 4;
   }
   #unmute-btn:focus { outline: 3px solid #4da3ff; }
+  /* Diagnostic readout of the <video>/hls.js internal state -- there's no
+     devtools on a TV, so this is the only way to see WHY a black screen is
+     happening (stuck paused? never buffering? decode errors?) without
+     physical access to a debugger. Small/unobtrusive but always on top. */
+  #debug {
+    position: absolute; left: 0; bottom: 0; right: 0; padding: 6px 10px;
+    font-family: monospace; font-size: 14px; color: #0f0; background: rgba(0,0,0,0.6);
+    pointer-events: none; z-index: 5; white-space: pre-wrap;
+  }
 </style>
 </head>
 <body>
@@ -50,6 +59,7 @@
   <div id="overlay-clock"></div>
   <button id="unmute-btn" type="button">🔊 Activar sonido</button>
   <div id="message">Cargando...</div>
+  <div id="debug"></div>
   <script src="hls.min.js"></script>
   <script>
     const params = new URLSearchParams(location.search);
@@ -60,6 +70,23 @@
     const overlayClock = document.getElementById('overlay-clock');
     const messageEl = document.getElementById('message');
     const unmuteBtn = document.getElementById('unmute-btn');
+    const debugEl = document.getElementById('debug');
+    let lastHlsEvent = '-';
+
+    // Surface MediaError from the <video> element itself -- this fires on
+    // decode/pipeline failures that may NOT go through hls.js's own ERROR
+    // event (e.g. the native-HLS fallback branch below sets video.src
+    // directly, bypassing hls.js entirely).
+    video.addEventListener('error', () => {
+      const err = video.error;
+      lastHlsEvent = `video error code=${err ? err.code : '?'}`;
+    });
+
+    setInterval(() => {
+      const buf = video.buffered.length ? video.buffered.end(video.buffered.length - 1).toFixed(1) : '0';
+      debugEl.textContent = `paused=${video.paused} readyState=${video.readyState} networkState=${video.networkState} ` +
+        `ct=${video.currentTime.toFixed(1)} buffered=${buf} muted=${video.muted}\nlast=${lastHlsEvent}`;
+    }, 1000);
 
     unmuteBtn.addEventListener('click', () => {
       video.muted = false;
@@ -104,23 +131,42 @@
     setInterval(tickClock, 1000);
     tickClock();
 
-    function attachHls(url) {
-      if (currentPlaylistUrl === url) return; // already playing this playlist
-      currentPlaylistUrl = url;
+    function attachHls(rawUrl) {
+      if (currentPlaylistUrl === rawUrl) return; // already playing this playlist
+      currentPlaylistUrl = rawUrl;
+      // Resolve to an ABSOLUTE url -- the backend hands back a root-relative
+      // path (e.g. "/hls/<key>/playlist.m3u8"), which the page's own fetch()/
+      // hls.js loader resolve fine against document baseURI, but some Smart
+      // TV native media pipelines (used via the video.canPlayType() branch
+      // below, which hands the URL off to an OS-level player outside the
+      // webview's own network stack) fail to resolve a relative URL at all
+      // and immediately reject it as unsupported (readyState=0,
+      // networkState=NETWORK_NO_SOURCE, video.error.code=4) without ever
+      // attempting a request.
+      const url = new URL(rawUrl, location.href).href;
       if (window.Hls && window.Hls.isSupported()) {
+        lastHlsEvent = 'using hls.js';
         if (hls) { try { hls.destroy(); } catch (_) {} }
         hls = new window.Hls({ liveDurationInfinity: true });
         hls.loadSource(url);
         hls.attachMedia(video);
         hls.on(window.Hls.Events.ERROR, (_evt, data) => {
+          lastHlsEvent = `${(data && data.fatal) ? 'FATAL' : 'warn'} ${(data && data.type) || '?'}/${(data && data.details) || '?'}`;
           if (data && data.fatal) {
+            // Surface the actual error on-screen -- on a TV there's no
+            // devtools/console to inspect, so this is the only practical
+            // way to find out WHY playback failed (e.g. codec/profile
+            // rejected by the decoder vs. a network/manifest error).
+            showMessage(`Error HLS: ${data.type || '?'} / ${data.details || '?'}`);
             // Let the next poll() cycle recover -- a fresh /api/hls-info
             // fetch will re-attach if the stream is still (or becomes) live.
             currentPlaylistUrl = null;
           }
         });
+        hls.on(window.Hls.Events.FRAG_BUFFERED, () => { lastHlsEvent = 'frag buffered ok'; });
       } else if (video.canPlayType('application/vnd.apple.mpegurl')) {
         // Native HLS support (Safari, some Smart TV browsers)
+        lastHlsEvent = 'using native HLS (video.src)';
         video.src = url;
       } else {
         showMessage('Este navegador no soporta HLS.');

@@ -197,8 +197,12 @@ echo "  ✓ Entorno virtual OK"
 
 # ---- 4. Python packages ----
 echo "▸ [4/7] Instalando paquetes Python..."
-pip install --quiet --upgrade pip 2>/dev/null
-pip install --quiet customtkinter sounddevice numpy 2>/dev/null
+# NOTE: no --quiet / no 2>/dev/null here on purpose -- with both, a slow or
+# stalled download looks IDENTICAL to a real hang (zero output either way),
+# and any real pip error (network/SSL/proxy) was being silently swallowed,
+# leaving only the generic "❌ Error en la instalación" with no detail.
+pip install --upgrade pip
+pip install customtkinter sounddevice numpy
 echo "  ✓ Paquetes Python OK"
 
 # PyGObject (gi + GstWebRTC/GstSdp typelibs), needed by tools/return-audio-receiver.py
